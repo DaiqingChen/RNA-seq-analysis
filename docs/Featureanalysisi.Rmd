@@ -1,0 +1,263 @@
+---
+title: "ColdExposureStudy"
+author: "Daiqing Chen"
+date: "4/22/2022"
+output: html_document
+---
+
+```{r}
+setwd("/Users/lasia/Documents/Cold study")
+raw_data<-read.table("GSE112582_raw_count.txt")
+```
+
+```{r}
+df<-matrix(as.numeric(unlist(raw_data[-1,c(2:17)])),nrow=46078,ncol=16)
+rownames(df) <- raw_data[-1,1]
+colnames(df) <- raw_data[1,-1]
+```
+
+```{r}
+df<-df[,c(5,6,1,2,7,8,3,4,13:16,9:12)]
+```
+
+```{r}
+library(limma)
+library(edgeR)
+library(Glimma)
+```
+
+```{r}
+########## Convert to an edgeR object
+dgeObj <- DGEList(df)
+group <-c(rep("BAT",4),rep("BAT_Cold",4),rep("WAT",4),rep("WAT_Cold",4))
+dgeObj$samples$group <- group
+
+########## remove too low count rows
+## Identify genes to remove by filterByExpr function in the edgeR 
+keep.exprs <- filterByExpr(dgeObj, group=group)
+dgeObj <- dgeObj[keep.exprs,, keep.lib.sizes=FALSE]
+dim(dgeObj)
+#[1] 19481    16
+dgeObj$samples$lib.size
+# [1] 61657313 67117261 58469005 55738918 54258389 65961936 66102217 64870310
+# [9] 66201305 61552351 61041280 57448584 66638143 62757911 64846758 71268555
+ 
+head(dgeObj$counts)
+```
+
+####### Annotate
+```{r}
+#BiocManager::install("org.Mm.eg.db")
+library("org.Mm.eg.db")
+geneList <- select(org.Mm.eg.db, 
+       keys = c(rownames(dgeObj$counts)),
+       columns = c("ENTREZID", "SYMBOL","GENENAME"),
+       keytype = "ENSEMBL") # ENSEMBL
+```
+```{r}
+library(clusterProfiler)
+geneList2<-bitr(rownames(dgeObj$counts), fromType="ENSEMBL", toType="SYMBOL", OrgDb="org.Mm.eg.db")
+```
+```{r}
+library( "biomaRt" ) 
+ensembl = useMart( "ensembl", dataset = "mmusculus_gene_ensembl" )
+geneList3 <- getBM( attributes = c("ensembl_gene_id", "mgi_symbol",'entrezgene_id','external_gene_name'), filters = "ensembl_gene_id",values = rownames(dgeObj$counts), mart = ensembl )
+```
+
+```{r}
+dgeObj$genes <- geneList
+dgeObj
+```
+```{r}
+dgeObj<-calcNormFactors(dgeObj,method="TMM")
+normalized_count<-data.frame(dgeObj$counts)
+write.csv(dgeObj$counts,"normalized_count.csv")
+```
+```{r}
+plotMDS(dgeObj$counts,col=rep(1:4, each=4))
+```
+
+### start the annalysis tool
+```{r}
+design <- model.matrix(~ 0+group)
+rownames(design) <- colnames(dgeObj$counts)
+design
+```
+
+```{r}
+contr.matrix <- makeContrasts(
+   BATvsBAT_Cold = groupBAT_Cold - groupBAT, 
+   WATvsWAT_Cold = groupWAT_Cold - groupWAT,
+   WATvsBAT = groupBAT-groupWAT,
+   WAT_ColdvsBAT_Cold = groupBAT_Cold - groupWAT_Cold,
+   levels = colnames(design))
+contr.matrix
+```
+
+Estimating the dispersion,
+Removing heteroscedascity from count data
+```{r}
+#The common dispersion estimates the overall BCV of the dataset, averaged over all genes:
+dgeObj <- estimateDisp(dgeObj,design = design)
+#Plot the estimated dispersions:
+plotBCV(dgeObj)
+```
+
+```{r}
+v <- voom(dgeObj, design, plot=TRUE)
+```
+LM fit
+```{r}
+vfit <- lmFit(v, design)
+vfit <- contrasts.fit(vfit, contrasts=contr.matrix)
+efit <- eBayes(vfit)
+plotSA(efit)
+```
+
+```{r}
+de <- decideTests(efit)
+summary(de)
+#  5% FDR is the criteria
+```
+
+```{r}
+tfit <- treat(efit, lfc=0.58)
+dt <- decideTests(tfit)
+summary(dt)
+```
+
+## choose genes based our criteria
+```{r}
+library(ggplot2)
+library(ggrepel)
+library(tidyr)
+library(dplyr)
+```
+(1)logFC>1 & adj.p < 0.05
+```{r}
+BATvsBAT_Cold. <- topTreat(efit, coef=1, n=Inf)
+WATvsWAT_Cold. <- topTreat(efit, coef=2, n=Inf)
+WATvsBAT. <- topTreat(efit, coef=3, n=Inf)
+WAT_ColdvsBAT_Cold. <- topTreat(efit, coef=4, n=Inf)
+```
+
+```{r}
+# get rid of genes without name
+BATvsBAT_Cold <- BATvsBAT_Cold.[!is.na(BATvsBAT_Cold.$ENTREZID),]
+WATvsWAT_Cold <- WATvsWAT_Cold.[!is.na(WATvsWAT_Cold.$ENTREZID),]
+WATvsBAT <- WATvsBAT.[!is.na(WATvsBAT.$ENTREZID),]
+WAT_ColdvsBAT_Cold <- WAT_ColdvsBAT_Cold.[!is.na(WAT_ColdvsBAT_Cold.$ENTREZID),]
+```
+
+```{r}
+# Create new categorical column ------------------------------------------------ 
+BATvsBAT_Cold <- BATvsBAT_Cold %>%
+  mutate(gene_type = case_when(logFC > 1 & adj.P.Val <= 0.05 ~ "up",
+                               logFC < -1 & adj.P.Val <= 0.05 ~ "down",
+                               TRUE ~ "ns"))   
+WATvsWAT_Cold <- WATvsWAT_Cold %>%
+  mutate(gene_type = case_when(logFC > 1 & adj.P.Val <= 0.05 ~ "up",
+                               logFC < -1 & adj.P.Val <= 0.05 ~ "down",
+                               TRUE ~ "ns"))   
+WATvsBAT <- WATvsBAT %>%
+  mutate(gene_type = case_when(logFC > 1 & adj.P.Val <= 0.05 ~ "up",
+                               logFC < -1 & adj.P.Val <= 0.05 ~ "down",
+                               TRUE ~ "ns"))   
+WAT_ColdvsBAT_Cold <- WAT_ColdvsBAT_Cold %>%
+  mutate(gene_type = case_when(logFC > 1 & adj.P.Val <= 0.05 ~ "up",
+                               logFC < -1 & adj.P.Val <= 0.05 ~ "down",
+                               TRUE ~ "ns"))
+```
+
+```{r}
+# Obtain gene_type counts ------------------------------------------------------           
+BATvsBAT_Cold %>% count(gene_type)
+WATvsWAT_Cold %>% count(gene_type)
+WATvsBAT %>% count(gene_type)
+WAT_ColdvsBAT_Cold %>% count(gene_type)
+```
+
+```{r}
+# Add colour, size and alpha (transparency) to volcano plot --------------------
+cols <- c("up" = "red", "down" = "blue", "ns" = "black") ##ffad73 #26b3ff
+```
+
+Take a look of how the overall trend look like
+```{r}
+pBATvsBAT_Cold <- ggplot(data=BATvsBAT_Cold, aes(x=logFC, y=-log10(adj.P.Val))) + 
+geom_point(aes(colour = gene_type),size = 0.5) + scale_colour_manual(values = cols) + geom_vline(xintercept=c(-0.58, 0.58), col="black",linetype = "dashed") +
+    geom_hline(yintercept=-log10(0.05), col="red",linetype = "dashed")
+pWATvsWAT_Cold <- ggplot(data=WATvsWAT_Cold, aes(x=logFC, y=-log10(adj.P.Val))) + 
+geom_point(aes(colour = gene_type),size = 0.5) + scale_colour_manual(values = cols) + geom_vline(xintercept=c(-0.58, 0.58), col="black",linetype = "dashed") +
+    geom_hline(yintercept=-log10(0.05), col="red",linetype = "dashed")
+pWATvsBAT <- ggplot(data=WATvsBAT, aes(x=logFC, y=-log10(adj.P.Val))) + 
+geom_point(aes(colour = gene_type),size = 0.5) + scale_colour_manual(values = cols) + geom_vline(xintercept=c(-0.58, 0.58), col="black",linetype = "dashed") +
+    geom_hline(yintercept=-log10(0.05), col="red",linetype = "dashed")
+pWAT_ColdvsBAT_Cold <- ggplot(data=WAT_ColdvsBAT_Cold, aes(x=logFC, y=-log10(adj.P.Val))) + 
+geom_point(aes(colour = gene_type),size = 0.5) + scale_colour_manual(values = cols) + geom_vline(xintercept=c(-0.58, 0.58), col="black",linetype = "dashed") +
+    geom_hline(yintercept=-log10(0.05), col="red",linetype = "dashed")
+
+cowplot::plot_grid(pBATvsBAT_Cold, pWATvsWAT_Cold, pWATvsBAT, pWAT_ColdvsBAT_Cold, ncol=2, labels=LETTERS[1:4])
+```
+# download package for cytoscape
+```{r}
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("RCy3")
+```
+
+```{r}
+library(RCy3)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
